@@ -13,7 +13,12 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-load_dotenv()
+_xdg_config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+_user_env = _xdg_config / "anna" / ".env"
+if _user_env.exists():
+    load_dotenv(_user_env)
+else:
+    load_dotenv()  # fallback: legacy behavior (search from caller / CWD)
 
 MIRRORS = [
     "https://annas-archive.gl",
