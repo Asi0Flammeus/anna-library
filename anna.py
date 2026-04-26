@@ -170,8 +170,8 @@ def fast_download(md5, output_dir=".", raw_name=False):
             title = details.get("title", "")
             author = details.get("author", "")
             pretty_name = build_filename(md5, title, author)
-        except Exception:
-            pass  # fall through to default naming
+        except Exception as e:
+            err(f"Warning: metadata fetch failed for {md5} ({type(e).__name__}: {e}); falling back to MD5 filename. Use --raw to silence.")
 
     url = f"{mirror}/dyn/api/fast_download.json"
     params = {"md5": md5, "key": key}
