@@ -49,7 +49,7 @@ anna search "the design of everyday things"
 anna search "dune" -l en -e epub -n 5
 ```
 
-Prints a JSON array. Current catalog cards carry a numeric `record_id`; legacy `/md5/` results also carry `md5`, which `info` and `dl` need.
+Prints a JSON array (`[]` when nothing matches). Every record has `record_id`, `title`, `author`, `metadata` and `url`. `info` and `dl` need an MD5, and only legacy `/md5/` results carry an `md5` field (their `record_id` is the same MD5). Current catalog cards, which is what `annas-archive.is` returns, have a numeric `record_id`, a `/books/` URL and **no `md5`**. You cannot download them with this CLI.
 
 ```json
 [
@@ -87,19 +87,28 @@ anna dl <md5_1> <md5_2> -o ~/Books   # batch
 anna dl <md5> --raw                  # MD5 as filename
 ```
 
-Files are named `Title - Author.ext` when metadata is reachable, `<md5>.ext` otherwise. One JSON line per downloaded file:
+Files are named `Title - Author.ext` when the metadata page is reachable, and `<md5>.ext` otherwise (or with `--raw`). One JSON line per downloaded file:
 
 ```json
-{"path": "/home/user/Books/Dune - Frank Herbert.epub", "md5": "<md5>", "filename": "Dune - Frank Herbert.epub"}
+{"path": "/home/user/Books/Title - Author.epub", "md5": "<md5>", "filename": "Title - Author.epub"}
 ```
+
+Pick an MD5 from search and download it in one pipeline, when the search results include legacy MD5 records:
+
+```bash
+md5=$(anna search "meditations marcus aurelius" -n 20 | jq -r '[.[] | select(.md5)][0].md5')
+[ "$md5" != null ] && anna dl "$md5" -o ~/Books
+```
+
+Each successful `dl` uses up one fast download from the account's daily quota.
 
 ## Filters
 
 | Flag | Description | Examples |
 |------|-------------|----------|
-| `-l` | Language | `en`, `fr`, `de` |
-| `-e` | Format | `pdf`, `epub`, `mobi` |
-| `-c` | Content type | `book_fiction`, `book_nonfiction` |
+| `-l` | Language, sent as `lang` (ignored by `annas-archive.is`) | `en`, `fr`, `de` |
+| `-e` | Format, sent as `ext` and `extension` | `pdf`, `epub`, `mobi` |
+| `-c` | Content type, sent as `content` (ignored by `annas-archive.is`) | `book_fiction`, `book_nonfiction` |
 | `-n` | Max results | `5`, `20` (default: 10) |
 
 ## Exit codes and errors
@@ -114,6 +123,7 @@ Files are named `Title - Author.ext` when metadata is reachable, `<md5>.ext` oth
 | `HTTP 401 … Invalid secret key` | The key is wrong |
 | `HTTP 403 … Not a member` | The key is valid but its membership is inactive |
 | `HTTP 403 DDoS-Guard challenge` (`info`, or a filename warning in `dl`) | HTML/metadata pages are blocked from your network; `dl` still works and names the file by MD5 |
+| `No download URL returned for <md5>: …` | The API answered without a link (for example `Record not found`); its `error` text follows |
 
 ## Tests
 

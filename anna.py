@@ -218,6 +218,7 @@ def search(query, lang="", ext="", content="", limit=10):
         params["lang"] = lang
     if ext:
         params["ext"] = ext
+        params["extension"] = ext  # .is names the format filter `extension`
     if content:
         params["content"] = content
 
