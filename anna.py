@@ -2,6 +2,7 @@
 """anna — CLI to search and download books from Anna's Archive."""
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -13,16 +14,19 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+# Config precedence: process environment, then ./.env, then ~/.config/anna/.env.
+# load_dotenv(override=False) never replaces a variable that is already set.
 _xdg_config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-_user_env = _xdg_config / "anna" / ".env"
-if _user_env.exists():
-    load_dotenv(_user_env)
-else:
-    load_dotenv()  # fallback: legacy behavior (search from caller / CWD)
+for _env_path in (Path.cwd() / ".env", _xdg_config / "anna" / ".env"):
+    if _env_path.exists():
+        load_dotenv(_env_path, override=False)
 
+# .gl/.gd serve the genuine member API. .is serves search pages only (no API):
+# it is kept for search, and get_api_mirror() never selects it for the key.
 MIRRORS = [
     "https://annas-archive.gl",
     "https://annas-archive.gd",
+    "https://annas-archive.is",
     "https://annas-archive.org",
     "https://annas-archive.li",
     "https://annas-archive.pm",
@@ -34,7 +38,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-MD5_RE = re.compile(r"/md5/([a-f0-9]{32})", re.IGNORECASE)
+MD5_RE = re.compile(r"/md5/([a-f0-9]{32})(?:[/?#]|$)", re.IGNORECASE)
+BOOK_RE = re.compile(r"/books/([0-9]+)(?:-[^/?#]+)?/?(?:[?#].*)?$")
 UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 MAX_FILENAME_LEN = 200
 
@@ -61,27 +66,84 @@ def build_filename(md5, title="", author=""):
     return " - ".join(parts)
 
 
-def get_mirror():
-    """Return configured mirror, or auto-detect a working one."""
-    configured = os.getenv("ANNAS_MIRROR", "").rstrip("/")
-    if configured:
-        return configured
+def is_search_capable(response):
+    """Return whether a response is Anna's HTML search page."""
+    if response.status_code != 200 or "html" not in response.headers.get("Content-Type", "").lower():
+        return False
 
-    for mirror in MIRRORS:
+    path = response.url.split("?", 1)[0].rstrip("/")
+    if not path.endswith("/search"):
+        return False
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    return bool(soup.select_one('form[role="search"] input[name="q"]'))
+
+
+def is_member_api(response):
+    """Return whether a response is Anna's genuine fast_download JSON API.
+
+    Probed without a key: the real API answers a keyless call with a JSON body
+    carrying a `download_url` field (null) and an `error`.
+    """
+    if "json" not in response.headers.get("Content-Type", "").lower():
+        return False
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    return isinstance(data, dict) and "download_url" in data
+
+
+def candidate_mirrors():
+    """ANNAS_MIRROR first when set, then the built-in list."""
+    configured = os.getenv("ANNAS_MIRROR", "").rstrip("/")
+    if not configured:
+        return MIRRORS
+    return [configured] + [m for m in MIRRORS if m != configured]
+
+
+@functools.cache
+def get_search_mirror():
+    """Return the first mirror that serves Anna's HTML search page."""
+    for mirror in candidate_mirrors():
         try:
-            requests.head(mirror, timeout=5, allow_redirects=True)
-            return mirror
+            response = requests.get(
+                f"{mirror}/search?q=anna", headers=HEADERS, timeout=10, allow_redirects=True,
+            )
+            if is_search_capable(response):
+                return mirror
         except requests.RequestException:
             continue
 
-    err("Error: No reachable mirror found. Set ANNAS_MIRROR in .env.")
+    err("Error: No search-capable mirror found (unreachable, or HTML behind a DDoS-Guard challenge). Set ANNAS_MIRROR to a mirror that works from your network.")
+    sys.exit(1)
+
+
+@functools.cache
+def get_api_mirror():
+    """Return the first mirror that serves the genuine member API.
+
+    The key is only ever sent to a mirror that passed this keyless probe, so a
+    lookalike domain that only serves search pages never receives it.
+    """
+    for mirror in candidate_mirrors():
+        try:
+            response = requests.get(
+                f"{mirror}/dyn/api/fast_download.json", headers=HEADERS, timeout=10, allow_redirects=False,
+            )
+            if is_member_api(response):
+                return mirror
+        except requests.RequestException:
+            continue
+
+    err("Error: No mirror serves the member API (/dyn/api/fast_download.json). Set ANNAS_MIRROR to a mirror that does.")
     sys.exit(1)
 
 
 def get_api_key():
     key = os.getenv("ANNAS_API_KEY")
     if not key or key == "your_key_here":
-        err("Error: ANNAS_API_KEY not set. Copy .env.example to .env and add your key.")
+        err("Error: ANNAS_API_KEY not set. Export it, or put it in ./.env or ~/.config/anna/.env (see .env.example).")
         sys.exit(1)
     return key
 
@@ -89,9 +151,68 @@ def get_api_key():
 # ── Search ──────────────────────────────────────────────────────────────────
 
 
+def parse_search_results(html, mirror, limit=10):
+    """Parse current and legacy Anna search-result markup into JSON-ready records."""
+    if limit <= 0:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+
+    for link in soup.select("h3 a[href]"):
+        href = link["href"]
+        match = BOOK_RE.search(href)
+        if not match:
+            continue
+
+        metadata_el = link.find_parent("h3").find_next_sibling("div")
+        metadata = " ".join(metadata_el.get_text(" ", strip=True).split()) if metadata_el else ""
+        metadata_parts = [part.strip() for part in metadata.split("·")]
+        author = metadata_parts[0] if metadata_parts else ""
+        if author == "Unknown author":
+            author = ""
+
+        path = href[href.find("/books/"):]
+        results.append({
+            "record_id": match.group(1),
+            "title": link.get_text(" ", strip=True),
+            "author": author,
+            "metadata": metadata,
+            "url": f"{mirror}{path}",
+        })
+        if len(results) >= limit:
+            return results
+
+    for link in soup.select("a.js-vim-focus[href]"):
+        href = link["href"]
+        match = MD5_RE.search(href)
+        if not match:
+            continue
+
+        md5 = match.group(1)
+        container = link.parent
+        author_el = container.select_one("a span.icon-\\[mdi--user-edit\\]") if container else None
+        author = author_el.parent.get_text(strip=True) if author_el and author_el.parent else ""
+        grandparent = container.parent if container else None
+        meta_el = grandparent.select_one("div.font-semibold.text-sm") if grandparent else None
+        metadata = meta_el.get_text(" ", strip=True).split("Save")[0].rstrip("· ").strip() if meta_el else ""
+        results.append({
+            "record_id": md5,
+            "md5": md5,
+            "title": link.get_text(" ", strip=True),
+            "author": author,
+            "metadata": metadata,
+            "url": f"{mirror}/md5/{md5}",
+        })
+        if len(results) >= limit:
+            break
+
+    return results
+
+
 def search(query, lang="", ext="", content="", limit=10):
     """Search Anna's Archive and return a list of results."""
-    mirror = get_mirror()
+    mirror = get_search_mirror()
     params = {"q": query}
     if lang:
         params["lang"] = lang
@@ -103,55 +224,32 @@ def search(query, lang="", ext="", content="", limit=10):
     url = f"{mirror}/search?{urlencode(params)}"
     resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    results = []
-
-    for link in soup.select("a.js-vim-focus"):
-        href = link.get("href", "")
-        md5_match = MD5_RE.search(href)
-        if not md5_match:
-            continue
-
-        md5 = md5_match.group(1)
-        title = link.get_text(strip=True)
-
-        author = ""
-        container = link.parent
-        if container:
-            author_el = container.select_one("a span.icon-\\[mdi--user-edit\\]")
-            if author_el and author_el.parent:
-                author = author_el.parent.get_text(strip=True)
-
-        meta = ""
-        grandparent = container.parent if container else None
-        if grandparent:
-            meta_el = grandparent.select_one("div.font-semibold.text-sm")
-            if meta_el:
-                meta = meta_el.get_text(strip=True)
-                meta = meta.split("Save")[0].strip().rstrip("·").strip()
-
-        results.append({
-            "md5": md5, "title": title, "author": author,
-            "meta": meta, "url": f"{mirror}/md5/{md5}",
-        })
-
-        if len(results) >= limit:
-            break
-
-    return results
+    return parse_search_results(resp.text, mirror, limit=limit)
 
 
 # ── Book details ────────────────────────────────────────────────────────────
 
 
+class DetailsError(Exception):
+    pass
+
+
 def get_book_details(md5):
-    """Fetch book details as JSON from /md5/{hash}.json."""
-    mirror = get_mirror()
+    """Fetch book details as JSON from /md5/{hash}.json on the member-API mirror."""
+    mirror = get_api_mirror()
     url = f"{mirror}/md5/{md5}.json"
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+    except requests.RequestException as e:
+        raise DetailsError(f"{mirror} unreachable ({type(e).__name__})") from None
+    if resp.status_code == 403 and "ddos-guard" in resp.text[:2000].lower():
+        raise DetailsError(f"HTTP 403 DDoS-Guard challenge on {mirror}: its HTML/metadata pages are blocked from this network (the download API is not)")
+    if resp.status_code != 200:
+        raise DetailsError(f"HTTP {resp.status_code} from {url}")
+    try:
+        return resp.json()
+    except ValueError:
+        raise DetailsError(f"non-JSON response from {url}") from None
 
 
 # ── Download ────────────────────────────────────────────────────────────────
@@ -159,7 +257,7 @@ def get_book_details(md5):
 
 def fast_download(md5, output_dir=".", raw_name=False):
     """Download a book using the fast download API."""
-    mirror = get_mirror()
+    mirror = get_api_mirror()
     key = get_api_key()
 
     # Fetch metadata for human-readable filename
@@ -175,13 +273,23 @@ def fast_download(md5, output_dir=".", raw_name=False):
 
     url = f"{mirror}/dyn/api/fast_download.json"
     params = {"md5": md5, "key": key}
-    resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    # Never let the request URL reach stderr: it carries the key as a query parameter.
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    except requests.RequestException as e:
+        err(f"Error: fast_download request to {mirror} failed ({type(e).__name__}).")
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    if resp.status_code != 200:
+        err(f"Error: fast_download for {md5} returned HTTP {resp.status_code} from {mirror}: {data.get('error', resp.reason)}")
+        return None
 
     download_url = data.get("download_url")
     if not download_url:
-        err(f"Error: No download URL returned. Response: {data}")
+        err(f"Error: No download URL returned for {md5}: {data.get('error', 'no error message')}")
         return None
 
     err(f"Downloading {pretty_name or md5}...")
@@ -223,6 +331,7 @@ def fast_download(md5, output_dir=".", raw_name=False):
 
     err(f"Saved: {output_path}")
     print(json.dumps({"path": str(output_path), "md5": md5, "filename": filename}))
+    return output_path
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -261,11 +370,16 @@ def main():
         print(json.dumps(results, ensure_ascii=False))
 
     elif args.command in ("download", "dl", "d"):
-        for md5 in args.md5:
-            fast_download(md5, output_dir=args.output, raw_name=args.raw)
+        failed = [md5 for md5 in args.md5 if fast_download(md5, output_dir=args.output, raw_name=args.raw) is None]
+        if failed:
+            sys.exit(1)
 
     elif args.command in ("info", "i"):
-        details = get_book_details(args.md5)
+        try:
+            details = get_book_details(args.md5)
+        except DetailsError as e:
+            err(f"Error: info for {args.md5} failed: {e}")
+            sys.exit(1)
         print(json.dumps(details, indent=2, ensure_ascii=False))
 
     else:
