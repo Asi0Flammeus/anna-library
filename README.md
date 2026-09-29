@@ -123,7 +123,8 @@ Each successful `dl` uses up one fast download from the account's daily quota.
 | `HTTP 401 … Invalid secret key` | The key is wrong |
 | `HTTP 403 … Not a member` | The key is valid but its membership is inactive |
 | `HTTP 403 DDoS-Guard challenge` (`info`, or a filename warning in `dl`) | HTML/metadata pages are blocked from your network; `dl` still works and names the file by MD5 |
-| `No download URL returned for <md5>: …` | The API answered without a link (for example `Record not found`); its `error` text follows |
+| `HTTP 404 … Record not found` / `HTTP 400 … Invalid md5` | The MD5 is unknown to the archive, or malformed |
+| `No download URL returned for <md5>: …` | The API answered 200 without a link; its `error` text follows |
 
 ## Tests
 
